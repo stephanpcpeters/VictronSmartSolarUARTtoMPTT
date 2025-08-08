@@ -1,0 +1,7 @@
+docker build -t vedirect-mqtt .
+docker run -d \
+  --name vedirect-uart \
+  --restart=unless-stopped \
+  --device=/dev/ttyHS2 \
+  --network=homeassistant \
+  vedirect-mqtt
