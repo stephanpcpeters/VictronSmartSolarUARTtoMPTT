@@ -118,7 +118,7 @@ def main():
                 lrc_ok = (sum(frame_bytes) & 0xFF) == 0
                 if not lrc_ok:
                     # Ongeldig frame → weggooien
-                    # print(f"Invalid checksum (sum={sum(frame_bytes)&0xFF}), dropping frame")
+                    print(f"Invalid checksum (sum={sum(frame_bytes)&0xFF}), dropping frame")
                     frame_bytes.clear()
                     frame_kv.clear()
                     continue
@@ -127,6 +127,7 @@ def main():
                 cleaned = {k: v for k, v in frame_kv.items() if not is_forbidden_key(k)}
 
                 # Publish
+                print(f"Publishing frame", repr(cleaned))
                 publish_frame(cleaned)
 
                 # Reset buffers voor volgend frame
