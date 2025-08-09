@@ -7,19 +7,23 @@ import serial
 import paho.mqtt.client as mqtt
 
 # ---------- Config via env vars ----------
-SERIAL_PORT   = os.getenv("SERIAL_PORT", "/dev/ttyHS2")
-BAUDRATE      = int(os.getenv("BAUDRATE", "19200"))
+SERIAL_PORT    = os.getenv("SERIAL_PORT", "/dev/ttyHS2")
+BAUDRATE       = int(os.getenv("BAUDRATE", "19200"))
 
-MQTT_HOST     = os.getenv("MQTT_HOST", "mqtt")
-MQTT_PORT     = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USER     = os.getenv("MQTT_USER", "")
-MQTT_PASS     = os.getenv("MQTT_PASS", "")
-TOPIC_PREFIX  = os.getenv("TOPIC_PREFIX", "victron/mppt")
-AVAIL_TOPIC   = os.getenv("AVAIL_TOPIC", "victron/status")
-PUBLISH_RETAIN = os.getenv("RETAIN", "true").lower() in ("1","true","yes")
+MQTT_HOST      = os.getenv("MQTT_HOST", "mqtt")
+MQTT_PORT      = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USER      = os.getenv("MQTT_USER", "")
+MQTT_PASS      = os.getenv("MQTT_PASS", "")
+TOPIC_PREFIX   = os.getenv("TOPIC_PREFIX", "victron/mppt")
+AVAIL_TOPIC    = os.getenv("AVAIL_TOPIC", "victron/status")
+PUBLISH_RETAIN = os.getenv("RETAIN", "true").lower() in ("1", "true", "yes")
 
-# keys met deze tekens worden verwijderd
+# Keys die we niet willen publiceren (bevatten # of *)
 FORBIDDEN_KEY_CHARS = ("#", "*")
+
+# Watchdogs
+FRAME_IDLE_TIMEOUT_S = int(os.getenv("FRAME_IDLE_TIMEOUT_S", "8"))   # reset buffer als er zolang geen regels kwamen
+FRAME_MAX_LINES      = int(os.getenv("FRAME_MAX_LINES", "128"))      # bescherm tegen runaway
 
 # ---------- MQTT setup ----------
 client = mqtt.Client(client_id=f"victron-uart-{int(time.time())}", clean_session=True)
@@ -63,10 +67,10 @@ def is_forbidden_key(key: str) -> bool:
     return any(ch in key for ch in FORBIDDEN_KEY_CHARS)
 
 def publish_frame(frame: dict):
-    # publiceer alle (gefilterde) key/values
-    for k, v in frame.items():
-        topic = f"{TOPIC_PREFIX}/{k}"
-        client.publish(topic, v, retain=PUBLISH_RETAIN)
+    # filter verboden keys en publiceer
+    cleaned = {k: v for k, v in frame.items() if k and not is_forbidden_key(k)}
+    for k, v in cleaned.items():
+        client.publish(f"{TOPIC_PREFIX}/{k}", v, retain=PUBLISH_RETAIN)
     client.publish(f"{TOPIC_PREFIX}/_ts", int(time.time()), retain=PUBLISH_RETAIN)
 
 def graceful_exit(*_):
@@ -81,29 +85,33 @@ def graceful_exit(*_):
 signal.signal(signal.SIGINT, graceful_exit)
 signal.signal(signal.SIGTERM, graceful_exit)
 
-# ---------- VE.Direct loop met checksum ----------
+# ---------- Main loop (zonder checksum) ----------
 def main():
     mqtt_connect()
     ser = open_serial()
 
-    # Buffer voor huidig frame
-    frame_bytes = bytearray()
     frame_kv = {}
+    last_line_ts = time.time()
+    line_count = 0
 
     while True:
         try:
             raw = ser.readline()
+            now = time.time()
+
+            # Idle watchdog: als te lang geen data → reset frame buffer
+            if now - last_line_ts > FRAME_IDLE_TIMEOUT_S and frame_kv:
+                frame_kv.clear()
+                line_count = 0
+
             if not raw:
+                # geen nieuwe regel, gewoon door
                 continue
 
-            # Accumuleer altijd de *ruwe bytes* (incl. newline)
-            frame_bytes.extend(raw)
-
-            # Parse leesbare lijn
+            last_line_ts = now
             try:
                 line = raw.decode("utf-8", errors="ignore").strip()
             except Exception:
-                # kan niet decoderen → laat maar zitten (bytes zitten al in frame_bytes)
                 continue
             if not line:
                 continue
@@ -112,42 +120,31 @@ def main():
             if key is None:
                 continue
 
-            # Einde van een VE.Direct frame: 'Checksum'
-            if key.lower() == "checksum":
-                # LRC: Som van ALLE bytes in het frame (inclusief deze regel) moet 0 mod 256 zijn
-                lrc_ok = (sum(frame_bytes) & 0xFF) == 0
-                if not lrc_ok:
-                    # Ongeldig frame → weggooien
-                    print(f"Invalid checksum (sum={sum(frame_bytes)&0xFF}), dropping frame")
-                    frame_bytes.clear()
-                    frame_kv.clear()
-                    continue
+            # Bewaar key/value (filteren pas bij publish)
+            frame_kv[key] = val
+            line_count += 1
 
-                # Geldig frame → filter keys met '#' of '*'
-                cleaned = {k: v for k, v in frame_kv.items() if not is_forbidden_key(k)}
-
-                # Publish
-                print(f"Publishing frame", repr(cleaned))
-                publish_frame(cleaned)
-
-                # Reset buffers voor volgend frame
-                frame_bytes.clear()
+            # Fallback runaway-protectie
+            if line_count > FRAME_MAX_LINES:
                 frame_kv.clear()
+                line_count = 0
                 continue
 
-            # Normale key → opslaan (maar nog niet publiceren)
-            # (We slaan ook 'SER#' etc. op; filtering gebeurt pas bij publish)
-            frame_kv[key] = val
+            # Einde van frame:
+            # 1) voorkeur: HSDS gezien (praktisch einde telegram)
+            # 2) alternatief: 'Checksum' gezien (maar we valideren hem niet meer)
+            if key == "HSDS" or key.lower() == "checksum":
+                publish_frame(frame_kv)
+                frame_kv.clear()
+                line_count = 0
 
         except serial.SerialException as e:
             print(f"Serial error: {e}. Reopening port in 3s...", flush=True)
             time.sleep(3)
             ser = open_serial()
-            # buffers leegmaken; we zitten midden in een frame dat we niet kunnen vervolgen
-            frame_bytes.clear()
             frame_kv.clear()
+            line_count = 0
         except Exception as e:
-            # log en ga door
             print(f"Loop error: {e}", flush=True)
 
 if __name__ == "__main__":
